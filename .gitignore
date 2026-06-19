@@ -1,0 +1,42 @@
+# Compilación de Rust
+/target/
+
+# Archivo de lock (depende del tipo de proyecto)
+# Mantenerlo si es una aplicación
+# Ignorarlo si es una librería
+# Cargo.lock
+
+# Archivos de respaldo de editores
+*.rs.bk
+
+# Configuración de IDEs
+.vscode/
+.idea/
+
+# Archivos temporales
+*.tmp
+*.swp
+*.swo
+*~
+
+# Logs
+*.log
+
+
+# Binarios generados manualmente
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Archivos de pruebas o dumps
+*.dump
+*.bak
+
+# Configuración local
+config.local.toml
+settings.local.toml
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db

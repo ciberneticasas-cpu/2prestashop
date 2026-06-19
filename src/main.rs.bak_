@@ -1,0 +1,646 @@
+use std::collections::HashMap;
+use std::error::Error;
+use std::fs::{self, File};
+use std::io::Write;
+use std::time::Instant;
+
+use chrono::Local;
+use futures_util::stream::StreamExt;
+use mysql_async::{params, prelude::*, Pool};
+use tiberius::{Client, Config};
+use tokio::net::TcpStream;
+use tokio_util::compat::TokioAsyncWriteCompatExt;
+
+// --- CONFIGURACION DE MARIADB (PrestaShop) ---
+const DB_PREFIX: &str = "ps_";
+const LOCAL_SYNC_CONFIG: &str = "/home/sistemas/prestashopsync/sync_config.env";
+const DEFAULT_AUDIT_HOSTS: [&str; 2] = ["192.168.0.231", "192.168.123.231"];
+
+#[derive(Debug)]
+struct Product {
+    id_product: u32,
+    name: String,
+    ean13: String,
+    reference: String,
+    current_qty: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
+struct ErpConnection {
+    port: u16,
+    database: String,
+    user: String,
+    password: String,
+}
+
+#[derive(Debug)]
+struct ErpStock {
+    by_ean: HashMap<String, i32>,
+    by_ref: HashMap<String, i32>,
+}
+
+#[derive(Debug)]
+struct ProductUpdate {
+    id_product: u32,
+    current_qty: i32,
+    erp_qty: i32,
+    pending_qty: i32,
+    final_qty: i32,
+    erp_key: String,
+}
+
+#[derive(Debug)]
+struct AuditRow {
+    id_product: u32,
+    name: String,
+    reference: String,
+    ean13: String,
+    code: String,
+    stock_prod: Option<i32>,
+    stock_test: Option<i32>,
+    stock_mariadb: i32,
+    pending_qty: i32,
+    sync_final_qty: Option<i32>,
+    action: String,
+}
+
+fn config_value(config: &HashMap<String, String>, key: &str, default: &str) -> String {
+    config
+        .get(key)
+        .filter(|s| !s.trim().is_empty())
+        .cloned()
+        .unwrap_or_else(|| default.to_string())
+}
+
+fn read_local_sync_config() -> HashMap<String, String> {
+    let mut values = HashMap::new();
+
+    if let Ok(contents) = fs::read_to_string(LOCAL_SYNC_CONFIG) {
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            if let Some((key, value)) = line.split_once('=') {
+                values.insert(key.trim().to_lowercase(), value.trim().to_string());
+            }
+        }
+    }
+
+    values
+}
+
+fn parse_hosts(value: Option<&String>, sync_host: &str) -> Vec<String> {
+    let mut hosts: Vec<String> = value
+        .map(|v| v.as_str())
+        .unwrap_or("192.168.0.231,192.168.123.231")
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+
+    if hosts.is_empty() {
+        hosts = DEFAULT_AUDIT_HOSTS.iter().map(|s| s.to_string()).collect();
+    }
+
+    if !hosts.iter().any(|h| h == sync_host) {
+        hosts.push(sync_host.to_string());
+    }
+
+    hosts
+}
+
+fn lookup_stock(stock: &ErpStock, ean13: &str, reference: &str) -> (Option<i32>, String, &'static str) {
+    if !ean13.is_empty() {
+        if let Some(qty) = stock.by_ean.get(ean13).copied() {
+            return (Some(qty), ean13.to_string(), "EAN");
+        }
+    }
+
+    if !reference.is_empty() {
+        if let Some(qty) = stock.by_ref.get(reference).copied() {
+            return (Some(qty), reference.to_string(), "REF");
+        }
+    }
+
+    let code = if !reference.is_empty() {
+        reference.to_string()
+    } else {
+        ean13.to_string()
+    };
+
+    (None, code, "SIN_MATCH")
+}
+
+async fn load_erp_stock(
+    host: &str,
+    erp: &ErpConnection,
+    almacenes_in_clause: &str,
+) -> Result<ErpStock, Box<dyn Error>> {
+    let mut mssql_config = Config::new();
+    mssql_config.host(host);
+    mssql_config.port(erp.port);
+    mssql_config.authentication(tiberius::AuthMethod::sql_server(&erp.user, &erp.password));
+    mssql_config.database(&erp.database);
+    mssql_config.encryption(tiberius::EncryptionLevel::NotSupported);
+//    mssql_config.trust_cert();
+
+    let tcp = TcpStream::connect(mssql_config.get_addr()).await?;
+    tcp.set_nodelay(true)?;
+
+    let mut mssql_client = Client::connect(mssql_config, tcp.compat_write()).await?;
+
+    let mssql_query = format!(
+        "SELECT \
+            TRIM(p.barras) AS CodigoBarras, \
+            TRIM(hp.referencia) AS Referencia, \
+            CAST(SUM(COALESCE(ip.invenactua, 0)) - SUM(COALESCE(ip.invensepar, 0)) AS INT) AS InventarioDisponible \
+         FROM Producto p \
+         INNER JOIN HeadProd hp ON hp.headprodid = p.headprodid \
+         LEFT JOIN InveProd ip ON ip.productoid = p.productoid AND ip.almacenid IN ({}) \
+         GROUP BY p.barras, hp.referencia",
+        almacenes_in_clause
+    );
+
+    let mut select_stream = mssql_client.query(mssql_query, &[]).await?;
+    let mut by_ean: HashMap<String, i32> = HashMap::new();
+    let mut by_ref: HashMap<String, i32> = HashMap::new();
+
+    while let Some(row_result) = select_stream.next().await {
+        let item = row_result?;
+        if let tiberius::QueryItem::Row(row) = item {
+            let ean = row.get::<&str, _>("CodigoBarras").unwrap_or("").trim().to_string();
+            let reference = row.get::<&str, _>("Referencia").unwrap_or("").trim().to_string();
+            let qty = row.get::<i32, _>("InventarioDisponible").unwrap_or(0).max(0);
+
+            if !ean.is_empty() {
+                by_ean.insert(ean, qty);
+            }
+            if !reference.is_empty() {
+                by_ref.insert(reference, qty);
+            }
+        }
+    }
+
+    Ok(ErpStock { by_ean, by_ref })
+}
+
+fn fmt_qty(value: Option<i32>) -> String {
+    value.map(|v| v.to_string()).unwrap_or_else(|| "SIN_MATCH".to_string())
+}
+
+fn csv_escape(value: &str) -> String {
+    let escaped = value.replace('"', "\"\"");
+    format!("\"{}\"", escaped)
+}
+
+fn sql_string(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('\'', "''");
+    format!("'{}'", escaped)
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn Error>> {
+    let total_start = Instant::now();
+    println!(
+        "[{}] Iniciando batch de sincronizacion de stock en Rust...",
+        Local::now().format("%Y-%m-%d %H:%M:%S")
+    );
+
+    let mariadb_start = Instant::now();
+    let mariadb_host = std::env::var("MARIADB_HOST").unwrap_or_else(|_| "www.mercaboy.com".to_string());
+    let mariadb_port = std::env::var("MARIADB_PORT")
+        .ok()
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(3306);
+    let mariadb_user = std::env::var("MARIADB_USER").unwrap_or_else(|_| "waplicaciones2".to_string());
+    let mariadb_pass = std::env::var("MARIADB_PASSWORD").unwrap_or_else(|_| "RL{MeEj)vQ(F".to_string());
+    let mariadb_db = std::env::var("MARIADB_DATABASE").unwrap_or_else(|_| "mercaboy_2024".to_string());
+
+    let connection_url = format!(
+        "mysql://{}:{}@{}:{}/{}",
+        mariadb_user, mariadb_pass, mariadb_host, mariadb_port, mariadb_db
+    );
+
+    let opts = mysql_async::Opts::from_url(&connection_url)?;
+    let pool = Pool::new(opts);
+    let mut conn = pool.get_conn().await?;
+    println!("Conectado a MariaDB con exito.");
+    let mariadb_connect_ms = mariadb_start.elapsed().as_millis();
+
+    let config_start = Instant::now();
+    let config_query = format!(
+        "SELECT name, value FROM {}configuration WHERE name LIKE 'MERCABOY_ERP_%'",
+        DB_PREFIX
+    );
+    let config_rows: Vec<(String, Option<String>)> = conn.query(config_query).await?;
+    let config: HashMap<String, String> = config_rows
+        .into_iter()
+        .map(|(k, v)| (k, v.unwrap_or_default()))
+        .collect();
+
+    let erp_connection = ErpConnection {
+        port: config
+            .get("MERCABOY_ERP_PORT")
+            .filter(|s| !s.trim().is_empty())
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(1433),
+        database: config_value(&config, "MERCABOY_ERP_DATABASE", "ERPFIVE_MERCABOY"),
+        user: config_value(&config, "MERCABOY_ERP_USER", "sa"),
+        password: "Cmmi.2025".to_string(),
+    };
+//        password: config_value(&config, "MERCABOY_ERP_PASSWORD", "Cmmi.2025"),
+    println!("DEBUG PASSWORD: ->{}<-", erp_connection.password);
+
+    let almacenes_str = config_value(&config, "MERCABOY_ERP_ALMACENES", "001,002,003");
+    let pending_window: i32 = config
+        .get("MERCABOY_ERP_PENDING_WINDOW")
+        .filter(|s| !s.trim().is_empty())
+        .and_then(|w| w.parse().ok())
+        .unwrap_or(10);
+
+    let local_config = read_local_sync_config();
+    let sync_host = local_config
+        .get("sync_host")
+        .cloned()
+        .unwrap_or_else(|| "192.168.0.231".to_string());
+    let audit_hosts = parse_hosts(local_config.get("audit_hosts"), &sync_host);
+
+    println!("Archivo local de sincronizacion: {}", LOCAL_SYNC_CONFIG);
+    println!("Servidor seleccionado para sincronizar MariaDB: {}", sync_host);
+    println!("Servidores auditados: {}", audit_hosts.join(", "));
+    println!("Almacenes ERP: {}", almacenes_str);
+    let config_ms = config_start.elapsed().as_millis();
+
+    let products_start = Instant::now();
+    let products_query = format!(
+        "SELECT p.id_product, COALESCE(pl.name, ''), COALESCE(p.ean13, ''), COALESCE(p.reference, ''), sa.quantity \
+         FROM {}product p \
+         INNER JOIN {}product_shop product_shop ON (product_shop.id_product = p.id_product AND product_shop.id_shop = 1) \
+         LEFT JOIN {}product_lang pl ON (pl.id_product = p.id_product AND pl.id_shop = 1 \
+             AND pl.id_lang = (SELECT CAST(value AS UNSIGNED) FROM {}configuration WHERE name = 'PS_LANG_DEFAULT' LIMIT 1)) \
+         LEFT JOIN {}stock_available sa ON (sa.id_product = p.id_product AND sa.id_product_attribute = 0 AND sa.id_shop = 1) \
+         WHERE product_shop.active = 1 \
+           AND ((p.reference IS NOT NULL AND p.reference <> '') OR (p.ean13 IS NOT NULL AND p.ean13 <> ''))",
+        DB_PREFIX, DB_PREFIX, DB_PREFIX, DB_PREFIX, DB_PREFIX
+    );
+
+    let ps_products: Vec<Product> = conn
+        .query_map(
+            products_query,
+            |(id_product, name, ean13, reference, current_qty): (
+                u32,
+                String,
+                String,
+                String,
+                Option<i32>,
+            )| Product {
+                id_product,
+                name,
+                ean13,
+                reference,
+                current_qty,
+            },
+        )
+        .await?;
+    println!("Encontrados {} productos activos en PrestaShop.", ps_products.len());
+    let products_ms = products_start.elapsed().as_millis();
+
+    let almacenes_list: Vec<String> = almacenes_str
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("'{}'", s.replace('\'', "''")))
+        .collect();
+    let almacenes_in_clause = almacenes_list.join(", ");
+
+    let mut stocks_by_host: HashMap<String, ErpStock> = HashMap::new();
+    let erp_start = Instant::now();
+    for host in &audit_hosts {
+        println!("Consultando inventario ERP en {}...", host);
+        let stock = load_erp_stock(host, &erp_connection, &almacenes_in_clause).await?;
+        println!(
+            "Cargados {} registros de stock desde {}.",
+            stock.by_ean.len() + stock.by_ref.len(),
+            host
+        );
+        stocks_by_host.insert(host.clone(), stock);
+    }
+    let erp_ms = erp_start.elapsed().as_millis();
+
+    let sync_stock = stocks_by_host
+        .get(&sync_host)
+        .ok_or_else(|| format!("No se cargo stock para el servidor de sincronizacion {}", sync_host))?;
+
+    let pending_start = Instant::now();
+    let cancel_rows: Vec<String> = conn
+        .query(format!(
+            "SELECT value FROM {}configuration WHERE name IN ('PS_OS_CANCELED', 'PS_OS_ERROR')",
+            DB_PREFIX
+        ))
+        .await?;
+    let cancel_list_str = if cancel_rows.is_empty() {
+        "6,8".to_string()
+    } else {
+        cancel_rows
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<String>>()
+            .join(",")
+    };
+
+    let pending_query = format!(
+        "SELECT od.product_id, CAST(SUM(od.product_quantity) AS SIGNED) AS qty \
+         FROM {}order_detail od \
+         INNER JOIN {}orders o ON o.id_order = od.id_order \
+         LEFT JOIN {}erp_order_export e ON e.id_order = o.id_order \
+         WHERE od.product_attribute_id = 0 \
+           AND o.current_state NOT IN ({}) \
+           AND ( \
+                 (e.id_erp_order_export IS NOT NULL AND e.erp_status IN ('pending', 'exported')) \
+                 OR ( \
+                     (e.erp_confirmed_at IS NULL OR e.id_erp_order_export IS NULL) \
+                     AND o.date_add >= DATE_SUB(NOW(), INTERVAL :pending_window MINUTE) \
+                 ) \
+           ) \
+         GROUP BY od.product_id",
+        DB_PREFIX, DB_PREFIX, DB_PREFIX, cancel_list_str
+    );
+
+    let pending_rows: Vec<(u32, Option<i64>)> = conn
+        .exec(
+            pending_query,
+            params! {
+                "pending_window" => pending_window,
+            },
+        )
+        .await?;
+
+    let mut pending_qty_map: HashMap<u32, i32> = HashMap::new();
+    for (product_id, qty) in pending_rows {
+        if let Some(q) = qty {
+            pending_qty_map.insert(product_id, q as i32);
+        }
+    }
+    let pending_ms = pending_start.elapsed().as_millis();
+
+    let audit_calc_start = Instant::now();
+    let mut products_to_update: Vec<ProductUpdate> = Vec::new();
+    let mut audit_rows: Vec<AuditRow> = Vec::new();
+    let mut skipped_count = 0u32;
+    let mut matched_by_ean = 0u32;
+    let mut matched_by_ref = 0u32;
+    let mut not_found_sync = 0u32;
+    let mut different_stock = 0u32;
+    let production_host = "192.168.0.231";
+    let test_host = "192.168.123.231";
+
+    for product in &ps_products {
+        let ean13 = product.ean13.trim();
+        let ref_code = product.reference.trim();
+        let current_qty = product.current_qty.unwrap_or(0);
+        let pending_qty = pending_qty_map.get(&product.id_product).copied().unwrap_or(0);
+
+        let (sync_qty, sync_key, match_type) = lookup_stock(sync_stock, ean13, ref_code);
+        if match_type == "EAN" {
+            matched_by_ean += 1;
+        } else if match_type == "REF" {
+            matched_by_ref += 1;
+        }
+
+        let prod_qty = stocks_by_host
+            .get(production_host)
+            .and_then(|stock| lookup_stock(stock, ean13, ref_code).0);
+        let test_qty = stocks_by_host
+            .get(test_host)
+            .and_then(|stock| lookup_stock(stock, ean13, ref_code).0);
+
+        let (sync_final_qty, action) = if let Some(erp_qty) = sync_qty {
+            let final_qty = (erp_qty - pending_qty).max(0);
+            if current_qty != final_qty {
+                different_stock += 1;
+                products_to_update.push(ProductUpdate {
+                    id_product: product.id_product,
+                    current_qty,
+                    erp_qty,
+                    pending_qty,
+                    final_qty,
+                    erp_key: sync_key.clone(),
+                });
+                (Some(final_qty), "ACTUALIZAR".to_string())
+            } else {
+                skipped_count += 1;
+                (Some(final_qty), "SIN_CAMBIO".to_string())
+            }
+        } else {
+            not_found_sync += 1;
+            skipped_count += 1;
+            (None, "SIN_MATCH_SYNC".to_string())
+        };
+
+        audit_rows.push(AuditRow {
+            id_product: product.id_product,
+            name: product.name.clone(),
+            reference: product.reference.clone(),
+            ean13: product.ean13.clone(),
+            code: sync_key,
+            stock_prod: prod_qty,
+            stock_test: test_qty,
+            stock_mariadb: current_qty,
+            pending_qty,
+            sync_final_qty,
+            action,
+        });
+    }
+    let audit_calc_ms = audit_calc_start.elapsed().as_millis();
+
+    println!();
+    println!("============================================================");
+    println!("RESUMEN GERENCIAL DE AUDITORIA");
+    println!("============================================================");
+    println!("Productos Prestashop              : {}", ps_products.len());
+    println!("Servidor sincronizacion MariaDB   : {}", sync_host);
+    println!("Coincidencias sync por EAN        : {}", matched_by_ean);
+    println!("Coincidencias sync por REF        : {}", matched_by_ref);
+    println!("Sin coincidencia en sync          : {}", not_found_sync);
+    println!("Registros que serian actualizados : {}", different_stock);
+    println!("Omitidos                          : {}", skipped_count);
+    println!("============================================================");
+    println!();
+
+    println!(
+        "{:<10} {:<20} {:>14} {:>14} {:>14} {:>8} {:>14} {:<16}",
+        "ID",
+        "CODIGO",
+        "INV_0_231",
+        "INV_123_231",
+        "MARIADB",
+        "PEND",
+        "FINAL_SYNC",
+        "ACCION"
+    );
+    println!("{}", "-".repeat(118));
+
+    for row in audit_rows
+        .iter()
+        .filter(|r| r.action == "ACTUALIZAR" || r.action == "SIN_MATCH_SYNC")
+        .take(200)
+    {
+        println!(
+            "{:<10} {:<20} {:>14} {:>14} {:>14} {:>8} {:>14} {:<16}",
+            row.id_product,
+            row.code,
+            fmt_qty(row.stock_prod),
+            fmt_qty(row.stock_test),
+            row.stock_mariadb,
+            row.pending_qty,
+            fmt_qty(row.sync_final_qty),
+            row.action
+        );
+    }
+
+    println!(
+        "Auditoria detecto {} registros que deberian actualizarse contra {}.",
+        products_to_update.len(),
+        sync_host
+    );
+    println!(
+        "De {} productos activos, {} requieren actualizar stock.",
+        ps_products.len(),
+        products_to_update.len()
+    );
+
+    let csv_start = Instant::now();
+    let csv_name = format!(
+        "stock_auditoria_{}.csv",
+        Local::now().format("%Y%m%d_%H%M%S")
+    );
+
+    let mut csv = File::create(&csv_name)?;
+    writeln!(
+        csv,
+        "id_product,nombre,referencia,ean13,codigo_match,inventario_192_168_0_231,inventario_192_168_123_231,inventario_mariadb,pendiente,final_sync,servidor_sync,accion"
+    )?;
+
+    for row in &audit_rows {
+        writeln!(
+            csv,
+            "{},{},{},{},{},{},{},{},{},{},{},{}",
+            row.id_product,
+            csv_escape(&row.name),
+            csv_escape(&row.reference),
+            csv_escape(&row.ean13),
+            csv_escape(&row.code),
+            fmt_qty(row.stock_prod),
+            fmt_qty(row.stock_test),
+            row.stock_mariadb,
+            row.pending_qty,
+            fmt_qty(row.sync_final_qty),
+            sync_host,
+            row.action
+        )?;
+    }
+
+    println!("Archivo CSV generado: {}", csv_name);
+    let csv_ms = csv_start.elapsed().as_millis();
+
+    let update_start = Instant::now();
+    let mut updated_count = 0;
+    for chunk in products_to_update.chunks(500) {
+        let mut tx = conn.start_transaction(mysql_async::TxOpts::default()).await?;
+
+        let ids = chunk
+            .iter()
+            .map(|product| product.id_product.to_string())
+            .collect::<Vec<String>>()
+            .join(",");
+        let qty_cases = chunk
+            .iter()
+            .map(|product| format!("WHEN {} THEN {}", product.id_product, product.final_qty))
+            .collect::<Vec<String>>()
+            .join(" ");
+
+        tx.query_drop(format!(
+            "UPDATE {}stock_available \
+             SET quantity = CASE id_product {} ELSE quantity END, \
+                 physical_quantity = CASE id_product {} ELSE physical_quantity END \
+             WHERE id_product_attribute = 0 AND id_shop = 1 AND id_product IN ({})",
+            DB_PREFIX, qty_cases, qty_cases, ids
+        ))
+        .await?;
+
+        let log_values = chunk
+            .iter()
+            .map(|product| {
+                format!(
+                    "({}, {}, {}, {}, {}, {}, {}, NOW())",
+                    sql_string(&product.erp_key),
+                    product.id_product,
+                    product.erp_qty,
+                    product.pending_qty,
+                    product.final_qty,
+                    product.current_qty,
+                    product.final_qty
+                )
+            })
+            .collect::<Vec<String>>()
+            .join(",");
+
+        tx.query_drop(format!(
+            "INSERT INTO {}erp_stock_sync_log ( \
+                erp_productoid, id_product, erp_disponible, ps_pendiente, \
+                qty_calculada, qty_anterior_ps, qty_aplicada, sync_at \
+             ) VALUES {}",
+            DB_PREFIX, log_values
+        ))
+        .await?;
+
+        updated_count += chunk.len();
+        tx.commit().await?;
+    }
+    let update_ms = update_start.elapsed().as_millis();
+
+    let metadata_start = Instant::now();
+    let now_str = Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    conn.exec_drop(
+        format!(
+            "UPDATE {}configuration SET value = :now WHERE name = 'MERCABOY_ERP_LAST_BATCH_AT'",
+            DB_PREFIX
+        ),
+        params! { "now" => now_str },
+    )
+    .await?;
+
+    conn.exec_drop(
+        format!(
+            "UPDATE {}configuration SET value = :updated WHERE name = 'MERCABOY_ERP_LAST_BATCH_UPDATED'",
+            DB_PREFIX
+        ),
+        params! { "updated" => updated_count.to_string() },
+    )
+    .await?;
+    let metadata_ms = metadata_start.elapsed().as_millis();
+
+    println!(
+        "Sincronizacion finalizada correctamente: {} actualizados, {} omitidos (sin cambios o sin match).",
+        updated_count, skipped_count
+    );
+    println!();
+    println!("============================================================");
+    println!("TIEMPOS DE EJECUCION (ms)");
+    println!("============================================================");
+    println!("Conexion MariaDB          : {}", mariadb_connect_ms);
+    println!("Configuracion             : {}", config_ms);
+    println!("Productos PrestaShop      : {}", products_ms);
+    println!("Consulta ERP total        : {}", erp_ms);
+    println!("Pendientes PrestaShop     : {}", pending_ms);
+    println!("Calculo auditoria         : {}", audit_calc_ms);
+    println!("CSV auditoria             : {}", csv_ms);
+    println!("Actualizacion MariaDB     : {}", update_ms);
+    println!("Metadata batch            : {}", metadata_ms);
+    println!("Total programa            : {}", total_start.elapsed().as_millis());
+    println!("============================================================");
+    Ok(())
+}
